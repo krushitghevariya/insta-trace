@@ -3,6 +3,7 @@
 InstaTrace – Instagram Private & Collab Media Extractor (2025/2026 POC)
 Streamlit Web Interface supporting Images, Videos, and Reels
 Fully responsive across desktop, laptop, tablet, and mobile screens.
+Includes Cloud Anti-429 Rate-Limit Mitigation & Cookie/Proxy Authentication.
 FOR SECURITY RESEARCH / EDUCATIONAL USE ONLY
 """
 
@@ -11,6 +12,7 @@ import requests
 import json
 import time
 import re
+import random
 from urllib.parse import unquote
 from bs4 import BeautifulSoup
 from io import StringIO, BytesIO
@@ -170,7 +172,6 @@ st.markdown("""
        5. RESPONSIVE COLUMNS & FLEX WRAPPING
        ========================================================= */
     @media (max-width: 992px) {
-        /* Tablet: Allow horizontal column containers to wrap */
         [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
             gap: 0.75rem 0.5rem !important;
@@ -178,13 +179,10 @@ st.markdown("""
     }
 
     @media (max-width: 768px) {
-        /* Tablet & Mobile: 2 columns per row */
         [data-testid="stHorizontalBlock"] > [data-testid="column"] {
             flex: 1 1 calc(50% - 0.5rem) !important;
             min-width: calc(50% - 0.5rem) !important;
         }
-        
-        /* Sidebar tap padding */
         [data-testid="stSidebar"] {
             padding-left: 0.5rem !important;
             padding-right: 0.5rem !important;
@@ -192,13 +190,10 @@ st.markdown("""
     }
 
     @media (max-width: 540px) {
-        /* Mobile phone: full width column stacking */
         [data-testid="stHorizontalBlock"] > [data-testid="column"] {
             flex: 1 1 100% !important;
             min-width: 100% !important;
         }
-        
-        /* Preserve 2-column layout for small buttons inside sidebar */
         [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > [data-testid="column"] {
             flex: 1 1 calc(50% - 0.35rem) !important;
             min-width: calc(50% - 0.35rem) !important;
@@ -350,6 +345,24 @@ def decode_url(escaped: str) -> str:
         return escaped
 
 
+def parse_cookie_string(cookie_input: str) -> Dict[str, str]:
+    """Parse raw sessionid or cookie header into a dictionary."""
+    cookies: Dict[str, str] = {}
+    if not cookie_input:
+        return cookies
+    cookie_input = cookie_input.strip()
+    if ";" in cookie_input or "=" in cookie_input:
+        for pair in cookie_input.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                cookies[k.strip()] = v.strip().strip('"')
+    else:
+        # User entered raw sessionid
+        cookies["sessionid"] = cookie_input
+    return cookies
+
+
 def parse_target_input(raw: str) -> Dict[str, Any]:
     """Parse user input into either profile username or direct reel/post URL."""
     raw = (raw or "").strip()
@@ -376,42 +389,97 @@ def parse_target_input(raw: str) -> Dict[str, Any]:
     return {"mode": "profile", "username": clean, "target": clean}
 
 
-def create_session() -> requests.Session:
-    """Create a persistent session with mobile emulating headers."""
+def create_session(cookie_str: str = "", proxy_url: str = "") -> requests.Session:
+    """Create an anti-rate-limit session with rotating browser headers, cookies, and proxies."""
     session = requests.Session()
-    session.headers.update({
-        'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+
+    ua_pool = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+    ]
+    chosen_ua = random.choice(ua_pool)
+
+    headers = {
+        'user-agent': chosen_ua,
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?1' if 'Mobile' in chosen_ua else '?0',
+        'sec-ch-ua-platform': '"Android"' if 'Android' in chosen_ua else ('"macOS"' if 'Macintosh' in chosen_ua else '"Windows"'),
         'sec-fetch-dest': 'document',
         'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
+        'sec-fetch-site': 'same-origin',
         'upgrade-insecure-requests': '1',
-    })
+        'x-ig-app-id': '936619743392459',
+        'x-asbd-id': '129477',
+    }
+    session.headers.update(headers)
+
+    # Attach proxy if provided
+    if proxy_url and proxy_url.strip():
+        p = proxy_url.strip()
+        session.proxies = {'http': p, 'https': p}
+
+    # Attach session cookies if provided (from UI or Streamlit Secrets)
+    effective_cookie = cookie_str.strip() if cookie_str else ""
+    if not effective_cookie:
+        # Check Streamlit Cloud secrets
+        try:
+            effective_cookie = getattr(st, "secrets", {}).get("IG_COOKIE", "") or getattr(st, "secrets", {}).get("SESSION_ID", "")
+        except Exception:
+            effective_cookie = ""
+
+    if effective_cookie:
+        cookies_dict = parse_cookie_string(effective_cookie)
+        session.cookies.update(cookies_dict)
+
     return session
 
 
 def fetch_tab_html(session: requests.Session, username: str, tab_path: str = "") -> Tuple[Optional[str], Optional[str]]:
-    """Fetch profile tab HTML (feed, reels, tagged)."""
+    """Fetch profile tab HTML with automatic backoff retry on 429."""
     url = f"https://www.instagram.com/{username}/{tab_path}"
-    try:
-        r = session.get(url, timeout=15)
-        if r.status_code == 200:
-            return r.text, None
-        return None, f"HTTP {r.status_code}"
-    except Exception as e:
-        return None, f"Connection error: {e}"
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            r = session.get(url, timeout=18)
+            if r.status_code == 200:
+                return r.text, None
+            if r.status_code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(2.0 + random.random() * 1.5)
+                    continue
+                return None, "HTTP 429 (Rate Limited by Instagram)"
+            return None, f"HTTP {r.status_code}"
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2.0)
+                continue
+            return None, f"Connection error: {e}"
+    return None, "Request failed"
 
 
 def fetch_direct_url(session: requests.Session, url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Fetch direct post or reel page."""
-    try:
-        r = session.get(url, timeout=15)
-        if r.status_code == 200:
-            return r.text, None
-        return None, f"HTTP {r.status_code}"
-    except Exception as e:
-        return None, f"Connection error: {e}"
+    """Fetch direct post or reel page with retry."""
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            r = session.get(url, timeout=18)
+            if r.status_code == 200:
+                return r.text, None
+            if r.status_code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(2.0 + random.random() * 1.5)
+                    continue
+                return None, "HTTP 429 (Rate Limited by Instagram)"
+            return None, f"HTTP {r.status_code}"
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2.0)
+                continue
+            return None, f"Connection error: {e}"
+    return None, "Request failed"
 
 
 def extract_media_from_node(node: dict, acc: List[Dict[str, Any]], current_pid: Optional[str] = None, source: str = "") -> None:
@@ -622,9 +690,17 @@ def extract_media_from_html(html: str, source: str = "") -> List[Dict[str, Any]]
     return acc
 
 
-def scan_target(target_info: Dict[str, Any], scan_reels: bool = True, scan_tagged: bool = True, scan_feed: bool = True) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Scan the target for feed, reels, and collab posts."""
-    session = create_session()
+def scan_target(
+    target_info: Dict[str, Any],
+    scan_reels: bool = True,
+    scan_tagged: bool = True,
+    scan_feed: bool = True,
+    cookie_str: str = "",
+    proxy_url: str = "",
+    delay: float = 1.5
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Scan target with session anti-429 features and pacing delay."""
+    session = create_session(cookie_str=cookie_str, proxy_url=proxy_url)
     
     # Pre-warm session to obtain Instagram session cookies
     try:
@@ -656,7 +732,11 @@ def scan_target(target_info: Dict[str, Any], scan_reels: bool = True, scan_tagge
         if scan_tagged:
             scan_jobs.append(("Tagged / Collabs Tab", "tagged/"))
 
-        for label, tab_path in scan_jobs:
+        for idx, (label, tab_path) in enumerate(scan_jobs):
+            # Human pacing delay between tabs to avoid rapid-fire 429 rate-limiting
+            if idx > 0 and delay > 0:
+                time.sleep(delay + random.uniform(0.1, 0.5))
+
             html, err = fetch_tab_html(session, username, tab_path)
             if html:
                 items = extract_media_from_html(html, source=label)
@@ -804,9 +884,11 @@ def _init_state() -> None:
     st.session_state.setdefault("target_input", "")
     st.session_state.setdefault("last_run_target", "")
     st.session_state.setdefault("run_error", None)
-    st.session_state.setdefault("media_found", None)  # None/True/False
+    st.session_state.setdefault("media_found", None)
     st.session_state.setdefault("media_items", None)
     st.session_state.setdefault("last_run_ts", None)
+    st.session_state.setdefault("cookie_input", "")
+    st.session_state.setdefault("proxy_input", "")
 
 
 def render_header() -> None:
@@ -835,6 +917,46 @@ def render_sidebar() -> Dict[str, Any]:
 
             run_clicked = st.form_submit_button("🚀 Start Scan", use_container_width=True)
 
+        # Anti-429 Rate-Limit Settings
+        with st.expander("🔑 Cloud Bypass & Rate Limits (Fix 429)", expanded=False):
+            st.caption("Shared cloud servers (AWS / Streamlit Cloud) may get HTTP 429 rate-limited by Instagram. Adding your session cookie bypasses this instantly.")
+            
+            cookie_default = ""
+            try:
+                cookie_default = getattr(st, "secrets", {}).get("IG_COOKIE", "") or getattr(st, "secrets", {}).get("SESSION_ID", "")
+            except Exception:
+                pass
+
+            cookie_input = st.text_input(
+                "Instagram sessionid / Cookie",
+                value=st.session_state.get("cookie_input", "") or cookie_default,
+                type="password",
+                help="Paste your sessionid from browser (F12 -> Application -> Cookies -> sessionid). Or set IG_COOKIE in Streamlit Secrets.",
+                placeholder="Paste sessionid or full cookie string"
+            )
+
+            proxy_default = ""
+            try:
+                proxy_default = getattr(st, "secrets", {}).get("PROXY", "")
+            except Exception:
+                pass
+
+            proxy_input = st.text_input(
+                "Proxy URL (Optional)",
+                value=st.session_state.get("proxy_input", "") or proxy_default,
+                help="Optional HTTP/HTTPS/SOCKS5 proxy (e.g. http://user:pass@host:port).",
+                placeholder="http://user:pass@host:port"
+            )
+
+            scan_delay = st.slider(
+                "Pacing delay (seconds)",
+                min_value=0.5,
+                max_value=4.0,
+                value=1.5,
+                step=0.5,
+                help="Adds a delay between tab scans to avoid triggering rate limits."
+            )
+
         st.divider()
         st.markdown("## 🎨 Display & Playback")
         show_previews = st.toggle("Enable Media Previews", value=True, help="Renders embedded video players and image previews.")
@@ -848,7 +970,7 @@ def render_sidebar() -> Dict[str, Any]:
             - **🎬 Reels & Clips:** Supports Reels tab and direct Reel links.
             - **🎥 Direct MP4 Streams:** Embedded video playback and direct MP4 downloads.
             - **🤝 Collab Posts:** Extracts co-authored posts & cover frames.
-            - **📷 Photos & Carousels:** Highest resolution variants.
+            - **🛡️ Rate-Limit Bypass:** Supports session cookies, proxies, and adaptive pacing.
             - **📱 Fully Responsive:** Optimized for desktop, tablet, and mobile screens.
             """
         )
@@ -868,6 +990,9 @@ def render_sidebar() -> Dict[str, Any]:
         "show_previews": show_previews,
         "gallery_cols": int(gallery_cols),
         "max_posts": int(max_posts),
+        "cookie_input": cookie_input,
+        "proxy_input": proxy_input,
+        "scan_delay": float(scan_delay),
     }
 
 
@@ -884,7 +1009,7 @@ def render_empty_state() -> None:
             <li><strong>Reels & Video Streams:</strong> Direct MP4 playback & downloads.</li>
             <li><strong>Collab Posts:</strong> Co-authored media exposed via timeline or tagged connections.</li>
             <li><strong>Multi-Device Ready:</strong> Full responsive layout across desktop, tablet, and mobile.</li>
-            <li><strong>Multiple Formats:</strong> Export results as TXT, CSV, or structured JSON.</li>
+            <li><strong>Cloud Rate-Limit Protection:</strong> Built-in cookie and proxy support to bypass HTTP 429.</li>
           </ul>
         </div>
         """,
@@ -894,14 +1019,36 @@ def render_empty_state() -> None:
 
 def render_run_status() -> None:
     if st.session_state.get("run_error"):
-        st.markdown(
-            f"""
-            <div class='error-box'>
-              <strong>⚠️ Notice:</strong> {st.session_state['run_error']}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        err = str(st.session_state['run_error'])
+        if "429" in err:
+            st.markdown(
+                """
+                <div class='error-box' style='border-left-color: #e0245e;'>
+                  <h4 style='margin:0 0 8px 0; color: #dc3545;'>🚫 Instagram Rate Limit (HTTP 429) on Cloud Server</h4>
+                  <p style='margin:0 0 10px 0;'>
+                    Streamlit Community Cloud runs on shared AWS servers whose public IP addresses are restricted by Instagram for anonymous browsing requests.
+                  </p>
+                  <strong>💡 How to bypass this immediately:</strong>
+                  <ol style='margin: 6px 0 0 0; padding-left: 22px; line-height: 1.7;'>
+                    <li>Open the sidebar → expand <strong>🔑 Cloud Bypass & Rate Limits (Fix 429)</strong>.</li>
+                    <li>Paste your Instagram <strong><code>sessionid</code></strong> cookie (from your browser DevTools → Application → Cookies → sessionid).</li>
+                    <li><em>(Permanent fix)</em> In Streamlit Cloud: Click <strong>App Settings</strong> → <strong>Secrets</strong> and add:
+                      <br><code>IG_COOKIE = "sessionid=YOUR_SESSION_ID"</code>
+                    </li>
+                  </ol>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"""
+                <div class='error-box'>
+                  <strong>⚠️ Notice:</strong> {err}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     media_found = st.session_state.get("media_found", None)
     if media_found is False and not st.session_state.get("run_error"):
@@ -1150,6 +1297,11 @@ def main() -> None:
         st.session_state["media_found"] = None
         st.session_state["media_items"] = None
 
+        cookie_val = str(ui.get("cookie_input", "")).strip()
+        proxy_val = str(ui.get("proxy_input", "")).strip()
+        st.session_state["cookie_input"] = cookie_val
+        st.session_state["proxy_input"] = proxy_val
+
         if not raw_in:
             st.session_state["run_error"] = "Target username or URL is required."
             st.rerun()
@@ -1164,7 +1316,10 @@ def main() -> None:
                 target_info,
                 scan_reels=bool(ui.get("scan_reels")),
                 scan_tagged=bool(ui.get("scan_tagged")),
-                scan_feed=bool(ui.get("scan_feed"))
+                scan_feed=bool(ui.get("scan_feed")),
+                cookie_str=cookie_val,
+                proxy_url=proxy_val,
+                delay=float(ui.get("scan_delay", 1.5))
             )
 
             if error:
