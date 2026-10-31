@@ -1,4 +1,6 @@
-bs4
-requests
-colorama==0.4.6
 streamlit
+requests
+beautifulsoup4
+bs4
+Pillow
+colorama==0.4.6
