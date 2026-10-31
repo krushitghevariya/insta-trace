@@ -337,12 +337,14 @@ def id_to_shortcode(media_id: int) -> str:
     return shortcode
 
 
-def decode_url(escaped: str) -> str:
+def decode_url(escaped: Any) -> str:
     """Decode URL from escaped format."""
+    if not escaped:
+        return ""
     try:
-        return unquote(escaped.encode('utf-8').decode('unicode_escape'))
+        return unquote(str(escaped).encode('utf-8').decode('unicode_escape'))
     except Exception:
-        return escaped
+        return str(escaped)
 
 
 def shortcode_to_id(shortcode: str) -> int:
@@ -1072,45 +1074,6 @@ def infer_download_meta(url: str, kind: str, res: str) -> Tuple[str, str]:
     return "jpg", "image/jpeg"
 
 
-def format_results_txt(media_items: List[Dict[str, Any]], target_name: str) -> str:
-    """Format results as detailed text report."""
-    if not media_items:
-        return ""
-
-    videos = [m for m in media_items if m.get("kind") == "video"]
-    images = [m for m in media_items if m.get("kind") != "video"]
-
-    by_post: Dict[str, List[Dict[str, Any]]] = {}
-    for m in media_items:
-        pid = m.get("post_id", "unknown")
-        by_post.setdefault(pid, []).append(m)
-
-    output = StringIO()
-    output.write(f"InstaTrace – Target: @{target_name}\n")
-    output.write("=" * 75 + "\n\n")
-    output.write(f"Total Media: {len(media_items)} | Videos/Reels: {len(videos)} | Images/Covers: {len(images)} | Posts: {len(by_post)}\n\n")
-
-    for pid in sorted(by_post.keys()):
-        items = by_post[pid]
-        shortcode = items[0].get("shortcode")
-        ig_link = f"https://www.instagram.com/p/{shortcode}/" if shortcode else "N/A"
-        cap = items[0].get("caption", "").strip()
-
-        output.write(f"📌 Post ID: {pid} (Shortcode: {shortcode or 'N/A'})\n")
-        output.write(f"   Instagram URL: {ig_link}\n")
-        if cap:
-            output.write(f"   Caption: {cap[:100]}\n")
-        output.write(f"   Assets ({len(items)} variants):\n")
-        output.write("-" * 75 + "\n")
-        for i, it in enumerate(items, 1):
-            type_tag = f"[{it.get('type_label', 'MEDIA')}]"
-            res = it.get('resolution', '?')
-            src = it.get('source', '')
-            output.write(f"  {i:2}. {type_tag:<20} {res:>12} ({src})  ->  {it.get('url')}\n")
-        output.write("\n")
-
-    return output.getvalue()
-
 
 def format_results_txt(media_items: List[Dict[str, Any]], target_name: str) -> str:
     """Format results as detailed text report."""
@@ -1469,11 +1432,13 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
             cols = st.columns(min(3, len(preview_items)) or 1)
             for i, it in enumerate(preview_items):
                 with cols[i % len(cols)]:
+                    p_url = str(it.get("url") or "")
+                    p_kind = str(it.get("kind") or "")
                     st.caption(f"{it.get('type_label')} • Post {it.get('post_id')} • {it.get('resolution')}")
-                    if it.get("kind") == "video":
-                        st.video(it.get("url"))
-                    else:
-                        img = load_image(it.get("url"))
+                    if p_kind == "video" and p_url:
+                        st.video(p_url)
+                    elif p_url:
+                        img = load_image(p_url)
                         if img:
                             st.image(img, use_container_width=True)
                         else:
@@ -1543,10 +1508,10 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
             cols = st.columns(gallery_cols)
             for j, it in enumerate(items_for_p):
                 with cols[j % len(cols)]:
-                    k = it.get("kind")
-                    res = it.get("resolution", "?")
-                    type_label = it.get("type_label", "Media")
-                    url = it.get("url")
+                    k = str(it.get("kind") or "")
+                    res = str(it.get("resolution") or "?")
+                    type_label = str(it.get("type_label") or "Media")
+                    url = str(it.get("url") or "")
 
                     # Badges
                     if k == "video":
@@ -1561,7 +1526,7 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
 
                     st.markdown(f"{item_collab_badge}<span class='{badge_class}'>{type_label}</span> <strong>{res}</strong>", unsafe_allow_html=True)
 
-                    if show_previews:
+                    if show_previews and url:
                         if k == "video":
                             st.video(url)
                         else:
@@ -1571,19 +1536,20 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
                             else:
                                 st.caption("Image preview unavailable")
 
-                    if show_url_box:
+                    if show_url_box and url:
                         st.code(url, language="text")
 
                     # Download button
-                    ext, mime = infer_download_meta(url, k, res)
-                    st.download_button(
-                        label=f"⬇️ Download {ext.upper()}",
-                        data=url,
-                        file_name=f"{target_name}_{pid}_{j+1}.{ext}",
-                        mime=mime,
-                        key=f"dl_{pid}_{j}",
-                        use_container_width=True,
-                    )
+                    if url:
+                        ext, mime = infer_download_meta(url, k, res)
+                        st.download_button(
+                            label=f"⬇️ Download {ext.upper()}",
+                            data=url,
+                            file_name=f"{target_name}_{pid}_{j+1}.{ext}",
+                            mime=mime,
+                            key=f"dl_{pid}_{j}",
+                            use_container_width=True,
+                        )
 
             st.divider()
 

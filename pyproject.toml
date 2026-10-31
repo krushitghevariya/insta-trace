@@ -1,0 +1,11 @@
+[tool.pyright]
+include = ["."]
+exclude = ["**/node_modules", "**/.next", "**/.venv"]
+venvPath = "."
+venv = ".venv"
+extraPaths = [
+    ".venv/Lib/site-packages",
+    "C:/Users/krush/AppData/Local/Programs/Python/Python312/Lib/site-packages"
+]
+reportMissingImports = false
+reportMissingModuleSource = false
