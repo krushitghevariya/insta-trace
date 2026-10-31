@@ -1,0 +1,4 @@
+bs4
+requests
+colorama==0.4.6
+streamlit
