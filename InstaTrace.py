@@ -345,28 +345,80 @@ def decode_url(escaped: str) -> str:
         return escaped
 
 
-def parse_cookie_string(cookie_input: str) -> Dict[str, str]:
-    """Parse raw sessionid or cookie header into a dictionary."""
+def shortcode_to_id(shortcode: str) -> int:
+    """Convert Instagram alphanumeric shortcode to numerical media ID."""
+    alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    media_id = 0
+    for char in shortcode:
+        if char in alphabet:
+            media_id = media_id * 64 + alphabet.index(char)
+    return media_id
+
+
+def parse_cookie_input(raw: str) -> Tuple[Dict[str, str], str]:
+    """Parse raw sessionid, cookie header, or exported JSON into cookies dict and header string."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}, ""
+
     cookies: Dict[str, str] = {}
-    if not cookie_input:
-        return cookies
-    cookie_input = cookie_input.strip()
-    if ";" in cookie_input or "=" in cookie_input:
-        for pair in cookie_input.split(";"):
+
+    # Strip leading 'Cookie:' or 'cookie:' if copied from DevTools headers
+    if raw.lower().startswith("cookie:"):
+        raw = raw[7:].strip()
+
+    # Try parsing as JSON (e.g. from Cookie-Editor / EditThisCookie)
+    if (raw.startswith("[") and raw.endswith("]")) or (raw.startswith("{") and raw.endswith("}")):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "name" in item and "value" in item:
+                        k = str(item["name"]).strip()
+                        v = str(item["value"]).strip().strip('"')
+                        if k:
+                            cookies[k] = v
+            elif isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    k_str = str(k).strip()
+                    v_str = str(v).strip().strip('"')
+                    if k_str:
+                        cookies[k_str] = v_str
+            if cookies:
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                return cookies, cookie_header
+        except Exception:
+            pass
+
+    # Standard key-value format (sessionid=xxx; csrftoken=yyy)
+    if "=" in raw:
+        for pair in raw.split(";"):
             pair = pair.strip()
             if "=" in pair:
                 k, v = pair.split("=", 1)
-                cookies[k.strip()] = v.strip().strip('"')
+                k = k.strip()
+                v = v.strip().strip('"')
+                if k:
+                    cookies[k] = v
     else:
-        # User entered raw sessionid
-        cookies["sessionid"] = cookie_input
+        # Raw session ID entered by user
+        clean_sid = raw.strip().strip('"').strip("'")
+        cookies["sessionid"] = clean_sid
+
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    return cookies, cookie_header
+
+
+def parse_cookie_string(cookie_input: str) -> Dict[str, str]:
+    """Compatibility wrapper for parse_cookie_input."""
+    cookies, _ = parse_cookie_input(cookie_input)
     return cookies
 
 
 def parse_target_input(raw: str) -> Dict[str, Any]:
     """Parse user input into either profile username or direct reel/post URL."""
     raw = (raw or "").strip()
-    
+
     # Check if direct reel URL
     m_reel = re.search(r"instagram\.com/(?:reel|reels)/([A-Za-z0-9_-]+)", raw)
     if m_reel:
@@ -424,17 +476,133 @@ def create_session(cookie_str: str = "", proxy_url: str = "") -> requests.Sessio
     # Attach session cookies if provided (from UI or Streamlit Secrets)
     effective_cookie = cookie_str.strip() if cookie_str else ""
     if not effective_cookie:
-        # Check Streamlit Cloud secrets
         try:
             effective_cookie = getattr(st, "secrets", {}).get("IG_COOKIE", "") or getattr(st, "secrets", {}).get("SESSION_ID", "")
         except Exception:
             effective_cookie = ""
 
     if effective_cookie:
-        cookies_dict = parse_cookie_string(effective_cookie)
-        session.cookies.update(cookies_dict)
+        cookies_dict, cookie_hdr = parse_cookie_input(effective_cookie)
+        if cookies_dict:
+            session.cookies.update(cookies_dict)
+            for k, v in cookies_dict.items():
+                session.cookies.set(k, v, domain=".instagram.com", path="/")
+            if cookie_hdr:
+                session.headers['Cookie'] = cookie_hdr
+            if "csrftoken" in cookies_dict:
+                session.headers['x-csrftoken'] = cookies_dict["csrftoken"]
 
     return session
+
+
+def validate_instagram_session(session: requests.Session) -> Tuple[bool, str]:
+    """Test if current session cookies are authenticated and valid."""
+    test_url = "https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram"
+    headers = {
+        'x-ig-app-id': '936619743392459',
+        'x-asbd-id': '129477',
+        'x-requested-with': 'XMLHttpRequest',
+        'referer': 'https://www.instagram.com/instagram/',
+        'accept': '*/*',
+    }
+    try:
+        r = session.get(test_url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            return True, "Active (Session Authenticated & Verified)"
+        elif r.status_code in (401, 403):
+            return False, "Expired or Invalid (Instagram returned HTTP 401 Login Required)"
+        elif r.status_code == 429:
+            return False, "Rate Limited (HTTP 429 - Instagram is throttling requests from this IP)"
+        else:
+            return False, f"Unexpected response (HTTP {r.status_code})"
+    except Exception as e:
+        return False, f"Connection test failed: {e}"
+
+
+def fetch_web_profile_info(session: requests.Session, username: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Fetch profile data from Instagram's web_profile_info API."""
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    headers = {
+        'x-ig-app-id': '936619743392459',
+        'x-asbd-id': '129477',
+        'x-requested-with': 'XMLHttpRequest',
+        'referer': f'https://www.instagram.com/{username}/',
+        'accept': '*/*',
+    }
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            r = session.get(url, headers=headers, timeout=18)
+            if r.status_code == 200:
+                try:
+                    return r.json(), None
+                except Exception as e:
+                    return None, f"JSON parse error: {e}"
+            if r.status_code in (401, 403):
+                return None, "HTTP 401/403: Instagram session expired or requires login."
+            if r.status_code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(2.0 + random.random() * 1.5)
+                    continue
+                return None, "HTTP 429 (Rate Limited by Instagram)"
+            return None, f"HTTP {r.status_code}"
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2.0)
+                continue
+            return None, f"Connection error: {e}"
+    return None, "Request failed"
+
+
+def fetch_user_tags(session: requests.Session, user_id: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Fetch user's tagged and collaborated posts from Instagram API."""
+    url = f"https://www.instagram.com/api/v1/usertags/{user_id}/feed/"
+    headers = {
+        'x-ig-app-id': '936619743392459',
+        'x-asbd-id': '129477',
+        'x-requested-with': 'XMLHttpRequest',
+        'accept': '*/*',
+    }
+    try:
+        r = session.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json(), None
+        return None, f"HTTP {r.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+
+def fetch_media_info_api(session: requests.Session, shortcode: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Fetch media info via media PK or GraphQL query."""
+    mid = shortcode_to_id(shortcode)
+    if mid > 0:
+        url = f"https://www.instagram.com/api/v1/media/{mid}/info/"
+        headers = {
+            'x-ig-app-id': '936619743392459',
+            'x-asbd-id': '129477',
+            'x-requested-with': 'XMLHttpRequest',
+            'accept': '*/*',
+        }
+        try:
+            r = session.get(url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                try:
+                    return r.json(), None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Try GraphQL doc_id
+    try:
+        gql_url = f"https://www.instagram.com/graphql/query/?doc_id=10015901848480474&variables={json.dumps({'shortcode': shortcode})}"
+        r = session.get(gql_url, timeout=15)
+        if r.status_code == 200:
+            return r.json(), None
+    except Exception:
+        pass
+
+    return None, "Media API lookup failed"
 
 
 def fetch_tab_html(session: requests.Session, username: str, tab_path: str = "") -> Tuple[Optional[str], Optional[str]]:
@@ -483,7 +651,7 @@ def fetch_direct_url(session: requests.Session, url: str) -> Tuple[Optional[str]
 
 
 def extract_media_from_node(node: dict, acc: List[Dict[str, Any]], current_pid: Optional[str] = None, source: str = "") -> None:
-    """Extract photos, videos, and reels from a JSON dictionary node."""
+    """Extract photos, videos, reels, and collab posts from any JSON node."""
     if not isinstance(node, dict):
         return
 
@@ -491,7 +659,7 @@ def extract_media_from_node(node: dict, acc: List[Dict[str, Any]], current_pid: 
     pid = str(pid).replace("POLARIS_", "")
 
     shortcode = node.get("code") or node.get("shortcode")
-    if not shortcode and pid.isdigit():
+    if not shortcode and str(pid).isdigit():
         try:
             shortcode = id_to_shortcode(int(pid))
         except Exception:
@@ -501,80 +669,103 @@ def extract_media_from_node(node: dict, acc: List[Dict[str, Any]], current_pid: 
     product_type = str(node.get("product_type", "")).lower()  # "clips", "feed", etc.
     typename = str(node.get("__typename", "")).lower()
     is_video_node = (
+        bool(node.get("is_video")) or
         media_type == 2 or
         product_type == "clips" or
         "video" in typename or
         "video" in str(node.get("__isXIGPolarisMedia", "")).lower()
     )
 
+    # Caption extraction (standard, GraphQL, or string)
     caption = ""
     cap_obj = node.get("caption")
     if isinstance(cap_obj, dict):
         caption = cap_obj.get("text", "") or ""
     elif isinstance(cap_obj, str):
         caption = cap_obj
+    elif "edge_media_to_caption" in node and isinstance(node["edge_media_to_caption"], dict):
+        edges = node["edge_media_to_caption"].get("edges", [])
+        if edges and isinstance(edges[0], dict):
+            caption = edges[0].get("node", {}).get("text", "") or ""
 
-    # 1. Video versions (highest-quality stream)
+    # Dimensions
+    dim = node.get("dimensions") or {}
+    w = dim.get("width") or node.get("original_width") or node.get("video_width") or "?"
+    h = dim.get("height") or node.get("original_height") or node.get("video_height") or "?"
+    res = f"{w}×{h}" if w != "?" and h != "?" else "Original"
+
+    # Collab info
+    collab_users = []
+    coauthors = node.get("coauthor_producers")
+    if isinstance(coauthors, list):
+        for co in coauthors:
+            if isinstance(co, dict) and co.get("username"):
+                collab_users.append(co["username"])
+
+    label_prefix = f"Collab with @{', @'.join(collab_users)} - " if collab_users else ""
+
+    # 1. Video versions (Direct MP4 streams from IG CDN)
     if "video_versions" in node and isinstance(node["video_versions"], list) and node["video_versions"]:
         best_v = None
         best_v_score = -1
         for v in node["video_versions"]:
             if not isinstance(v, dict) or not v.get("url"):
                 continue
-            w = v.get("width")
-            h = v.get("height")
-            score = (w * h) if isinstance(w, int) and isinstance(h, int) else 0
+            vw = v.get("width")
+            vh = v.get("height")
+            score = (vw * vh) if isinstance(vw, int) and isinstance(vh, int) else 0
             if score > best_v_score:
                 best_v_score = score
                 best_v = v
 
         if best_v and best_v.get("url"):
-            w = best_v.get("width", "?")
-            h = best_v.get("height", "?")
-            label = "Reel (Video)" if product_type == "clips" else "Video"
+            vw = best_v.get("width", "?")
+            vh = best_v.get("height", "?")
+            label = f"{label_prefix}Reel (Video)" if (product_type == "clips" or "clips" in source.lower()) else f"{label_prefix}Video"
             acc.append({
                 "post_id": pid,
                 "shortcode": shortcode,
                 "kind": "video",
                 "type_label": label,
-                "resolution": f"{w}×{h}",
+                "resolution": f"{vw}×{vh}",
                 "url": decode_url(best_v["url"]),
                 "caption": caption,
                 "source": source,
+                "collabs": collab_users,
             })
 
-    # 2. Direct video_url
+    # 2. Direct video_url (GraphQL)
     if "video_url" in node and isinstance(node["video_url"], str) and node["video_url"]:
-        w = node.get("video_width") or node.get("dimensions", {}).get("width") or "?"
-        h = node.get("video_height") or node.get("dimensions", {}).get("height") or "?"
-        label = "Reel (Video)" if product_type == "clips" else "Video"
+        label = f"{label_prefix}Reel (Video)" if (product_type == "clips" or "felix" in source.lower() or "clips" in source.lower()) else f"{label_prefix}Video"
         acc.append({
             "post_id": pid,
             "shortcode": shortcode,
             "kind": "video",
             "type_label": label,
-            "resolution": f"{w}×{h}",
+            "resolution": res,
             "url": decode_url(node["video_url"]),
             "caption": caption,
             "source": source,
+            "collabs": collab_users,
         })
 
     # 3. Video resources list (GraphQL)
     if "video_resources" in node and isinstance(node["video_resources"], list):
         for vr in node["video_resources"]:
             if isinstance(vr, dict) and vr.get("src"):
-                w = vr.get("config_width", "?")
-                h = vr.get("config_height", "?")
-                label = "Reel (Video)" if product_type == "clips" else "Video"
+                vw = vr.get("config_width", "?")
+                vh = vr.get("config_height", "?")
+                label = f"{label_prefix}Reel (Video)" if (product_type == "clips" or "clips" in source.lower()) else f"{label_prefix}Video"
                 acc.append({
                     "post_id": pid,
                     "shortcode": shortcode,
                     "kind": "video",
                     "type_label": label,
-                    "resolution": f"{w}×{h}",
+                    "resolution": f"{vw}×{vh}",
                     "url": decode_url(vr["src"]),
                     "caption": caption,
                     "source": source,
+                    "collabs": collab_users,
                 })
 
     # 4. Image candidates / Cover Frame
@@ -586,54 +777,68 @@ def extract_media_from_node(node: dict, acc: List[Dict[str, Any]], current_pid: 
             for cand in cands:
                 if not isinstance(cand, dict) or not cand.get("url"):
                     continue
-                w = cand.get("width")
-                h = cand.get("height")
-                score = (w * h) if isinstance(w, int) and isinstance(h, int) else 0
+                cw = cand.get("width")
+                ch = cand.get("height")
+                score = (cw * ch) if isinstance(cw, int) and isinstance(ch, int) else 0
                 if score > best_cand_score:
                     best_cand_score = score
                     best_cand = cand
 
             if best_cand and best_cand.get("url"):
-                w = best_cand.get("width", "?")
-                h = best_cand.get("height", "?")
+                cw = best_cand.get("width", "?")
+                ch = best_cand.get("height", "?")
                 if is_video_node:
                     kind = "reel_cover" if product_type == "clips" else "video_cover"
-                    label = "Reel Cover Frame" if product_type == "clips" else "Video Thumbnail"
+                    label = f"{label_prefix}Reel Cover Frame" if product_type == "clips" else f"{label_prefix}Video Thumbnail"
                 else:
                     kind = "image"
-                    label = "Image"
+                    label = f"{label_prefix}Image"
 
                 acc.append({
                     "post_id": pid,
                     "shortcode": shortcode,
                     "kind": kind,
                     "type_label": label,
-                    "resolution": f"{w}×{h}",
+                    "resolution": f"{cw}×{ch}",
                     "url": decode_url(best_cand["url"]),
                     "caption": caption,
                     "source": source,
+                    "collabs": collab_users,
                 })
 
-    # 5. Direct display_uri / display_url
+    # 5. Direct display_uri / display_url (GraphQL)
     elif node.get("display_uri") or node.get("display_url"):
         d_url = node.get("display_uri") or node.get("display_url")
         if is_video_node:
             kind = "reel_cover" if product_type == "clips" else "video_cover"
-            label = "Reel Cover Frame" if product_type == "clips" else "Video Thumbnail"
+            label = f"{label_prefix}Reel Cover Frame" if product_type == "clips" else f"{label_prefix}Video Thumbnail"
         else:
             kind = "image"
-            label = "Image"
+            label = f"{label_prefix}Image"
 
         acc.append({
             "post_id": pid,
             "shortcode": shortcode,
             "kind": kind,
             "type_label": label,
-            "resolution": "Original",
+            "resolution": res,
             "url": decode_url(d_url),
             "caption": caption,
             "source": source,
+            "collabs": collab_users,
         })
+
+    # 6. Carousel sidecar children (Multi-item posts)
+    if "edge_sidecar_to_children" in node and isinstance(node["edge_sidecar_to_children"], dict):
+        edges = node["edge_sidecar_to_children"].get("edges", [])
+        for edge in edges:
+            if isinstance(edge, dict) and "node" in edge:
+                extract_media_from_node(edge["node"], acc, current_pid=pid, source=f"{source} (Carousel Slide)")
+
+    if "carousel_media" in node and isinstance(node["carousel_media"], list):
+        for cnode in node["carousel_media"]:
+            if isinstance(cnode, dict):
+                extract_media_from_node(cnode, acc, current_pid=pid, source=f"{source} (Carousel Slide)")
 
 
 def walk_json(data: Any, acc: List[Dict[str, Any]], current_pid: Optional[str] = None, source: str = "") -> None:
@@ -649,7 +854,7 @@ def walk_json(data: Any, acc: List[Dict[str, Any]], current_pid: Optional[str] =
 
 
 def extract_media_from_html(html: str, source: str = "") -> List[Dict[str, Any]]:
-    """Extract media from all embedded scripts and regex patterns in the HTML page."""
+    """Extract media from all embedded scripts, ServerJS objects, and regex patterns in the HTML page."""
     if not html:
         return []
 
@@ -658,16 +863,46 @@ def extract_media_from_html(html: str, source: str = "") -> List[Dict[str, Any]]
 
     # 1. Inspect all script tags
     for script in soup.find_all("script"):
-        text = script.string or ""
+        text = script.string or script.text or ""
         if not text:
             continue
-        # Check if script might contain timeline, clips, reels, or media items
+
+        # Try direct JSON parsing
         if any(term in text for term in ["image_versions2", "video_versions", "video_url", "polaris", "clips", "timeline", "shortcode"]):
             try:
                 data = json.loads(text)
                 walk_json(data, acc, source=source)
+                continue
             except Exception:
                 pass
+
+        # Try extracting JSON inside s.handle(...)
+        if "s.handle(" in text:
+            for m in re.finditer(r's\.handle\((\{.*?\})\);', text):
+                try:
+                    data = json.loads(m.group(1))
+                    walk_json(data, acc, source=source)
+                except Exception:
+                    pass
+
+        # Try window.__additionalDataLoaded
+        if "__additionalDataLoaded" in text:
+            for m in re.finditer(r'__additionalDataLoaded\s*\([^,]+,\s*(\{.*?\})\s*\);', text):
+                try:
+                    data = json.loads(m.group(1))
+                    walk_json(data, acc, source=source)
+                except Exception:
+                    pass
+
+        # Try window._sharedData
+        if "_sharedData" in text:
+            m = re.search(r'_sharedData\s*=\s*(\{.*?\});', text)
+            if m:
+                try:
+                    data = json.loads(m.group(1))
+                    walk_json(data, acc, source=source)
+                except Exception:
+                    pass
 
     # 2. Safety Regex Extraction for direct .mp4 CDN video streams
     mp4_pattern = re.findall(r'https?:\\?/\\?/[^"\'<>\s]+?(?:fbcdn|cdninstagram)\.[a-z]+[^"\'<>\s]+?\.mp4[^"\'<>\s]*', html)
@@ -684,6 +919,7 @@ def extract_media_from_html(html: str, source: str = "") -> List[Dict[str, Any]]
                 "url": clean_mp4,
                 "caption": "",
                 "source": source,
+                "collabs": [],
             })
             existing_urls.add(clean_mp4)
 
@@ -699,14 +935,8 @@ def scan_target(
     proxy_url: str = "",
     delay: float = 1.5
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Scan target with session anti-429 features and pacing delay."""
+    """Scan target with session anti-429 features, authenticated API support, and pacing delay."""
     session = create_session(cookie_str=cookie_str, proxy_url=proxy_url)
-    
-    # Pre-warm session to obtain Instagram session cookies
-    try:
-        session.get("https://www.instagram.com/", timeout=8)
-    except Exception:
-        pass
 
     all_media: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -714,35 +944,85 @@ def scan_target(
     if target_info["mode"] in ("direct_reel", "direct_post"):
         code = target_info["shortcode"]
         path_type = "reel" if target_info["mode"] == "direct_reel" else "p"
+
+        # 1. Try Direct API / GraphQL if cookies are set
+        api_data, api_err = fetch_media_info_api(session, code)
+        if api_data:
+            walk_json(api_data, all_media, source="Media Info API")
+
+        # 2. Try Embed captioned URL (high success rate)
+        embed_url = f"https://www.instagram.com/p/{code}/embed/captioned/"
+        emb_html, emb_err = fetch_direct_url(session, embed_url)
+        if emb_html:
+            items = extract_media_from_html(emb_html, source="Instagram Embed")
+            all_media.extend(items)
+
+        # 3. Direct URL HTML
         direct_url = f"https://www.instagram.com/{path_type}/{code}/"
         html, err = fetch_direct_url(session, direct_url)
         if html:
-            items = extract_media_from_html(html, source="Direct URL")
+            items = extract_media_from_html(html, source="Direct Page")
             all_media.extend(items)
-        if err:
+        if err and not all_media:
             errors.append(f"Direct fetch: {err}")
 
     elif target_info["mode"] == "profile":
         username = target_info["username"]
-        scan_jobs = []
-        if scan_feed:
-            scan_jobs.append(("Feed / Timeline", ""))
-        if scan_reels:
-            scan_jobs.append(("Reels / Clips Tab", "reels/"))
-        if scan_tagged:
-            scan_jobs.append(("Tagged / Collabs Tab", "tagged/"))
+        profile_api_success = False
 
-        for idx, (label, tab_path) in enumerate(scan_jobs):
-            # Human pacing delay between tabs to avoid rapid-fire 429 rate-limiting
-            if idx > 0 and delay > 0:
-                time.sleep(delay + random.uniform(0.1, 0.5))
+        # --- Tier 1: Authenticated Web Profile Info API ---
+        api_data, api_err = fetch_web_profile_info(session, username)
+        if api_data and "data" in api_data and "user" in api_data["data"]:
+            user_obj = api_data["data"]["user"]
+            if user_obj:
+                profile_api_success = True
+                user_id = user_obj.get("id")
+                is_private = user_obj.get("is_private", False)
 
-            html, err = fetch_tab_html(session, username, tab_path)
-            if html:
-                items = extract_media_from_html(html, source=label)
-                all_media.extend(items)
-            if err:
-                errors.append(f"{label}: {err}")
+                # Feed / Timeline Media
+                if scan_feed:
+                    timeline = user_obj.get("edge_owner_to_timeline_media", {})
+                    walk_json(timeline, all_media, source="Profile Timeline API")
+
+                # Reels / Felix Video Timeline
+                if scan_reels:
+                    reels_timeline = user_obj.get("edge_felix_video_timeline", {})
+                    walk_json(reels_timeline, all_media, source="Reels Timeline API")
+
+                # Tagged & Collabs API (if user ID is present)
+                if scan_tagged and user_id:
+                    if delay > 0:
+                        time.sleep(delay)
+                    tags_data, tags_err = fetch_user_tags(session, user_id)
+                    if tags_data:
+                        walk_json(tags_data, all_media, source="Tagged & Collabs API")
+
+                if is_private and not all_media:
+                    errors.append(f"Account @{username} is private and the authenticated session is not following them.")
+
+        if api_err:
+            errors.append(f"Profile API: {api_err}")
+
+        # --- Tier 2: Fallback to HTML Tab scraping if API returned 0 media or failed ---
+        if not all_media or not profile_api_success:
+            scan_jobs = []
+            if scan_feed:
+                scan_jobs.append(("Feed / Timeline", ""))
+            if scan_reels:
+                scan_jobs.append(("Reels / Clips Tab", "reels/"))
+            if scan_tagged:
+                scan_jobs.append(("Tagged / Collabs Tab", "tagged/"))
+
+            for idx, (label, tab_path) in enumerate(scan_jobs):
+                if idx > 0 and delay > 0:
+                    time.sleep(delay + random.uniform(0.1, 0.4))
+
+                html, err = fetch_tab_html(session, username, tab_path)
+                if html:
+                    items = extract_media_from_html(html, source=label)
+                    all_media.extend(items)
+                if err:
+                    errors.append(f"{label}: {err}")
 
     # Deduplicate media by URL
     unique_items: Dict[str, Dict[str, Any]] = {}
@@ -832,6 +1112,49 @@ def format_results_txt(media_items: List[Dict[str, Any]], target_name: str) -> s
     return output.getvalue()
 
 
+def format_results_txt(media_items: List[Dict[str, Any]], target_name: str) -> str:
+    """Format results as detailed text report."""
+    if not media_items:
+        return ""
+
+    videos = [m for m in media_items if m.get("kind") == "video"]
+    images = [m for m in media_items if m.get("kind") != "video"]
+
+    by_post: Dict[str, List[Dict[str, Any]]] = {}
+    for m in media_items:
+        pid = m.get("post_id", "unknown")
+        by_post.setdefault(pid, []).append(m)
+
+    output = StringIO()
+    output.write(f"InstaTrace – Target: @{target_name}\n")
+    output.write("=" * 75 + "\n\n")
+    output.write(f"Total Media: {len(media_items)} | Videos/Reels: {len(videos)} | Images/Covers: {len(images)} | Posts: {len(by_post)}\n\n")
+
+    for pid in sorted(by_post.keys()):
+        items = by_post[pid]
+        shortcode = items[0].get("shortcode")
+        ig_link = f"https://www.instagram.com/p/{shortcode}/" if shortcode else "N/A"
+        cap = items[0].get("caption", "").strip()
+        collabs = items[0].get("collabs", [])
+
+        output.write(f"📌 Post ID: {pid} (Shortcode: {shortcode or 'N/A'})\n")
+        output.write(f"   Instagram URL: {ig_link}\n")
+        if collabs:
+            output.write(f"   Collaborators: @{', @'.join(collabs)}\n")
+        if cap:
+            output.write(f"   Caption: {cap[:100]}\n")
+        output.write(f"   Assets ({len(items)} variants):\n")
+        output.write("-" * 75 + "\n")
+        for i, it in enumerate(items, 1):
+            type_tag = f"[{it.get('type_label', 'MEDIA')}]"
+            res = it.get('resolution', '?')
+            src = it.get('source', '')
+            output.write(f"  {i:2}. {type_tag:<24} {res:>12} ({src})  ->  {it.get('url')}\n")
+        output.write("\n")
+
+    return output.getvalue()
+
+
 def format_results_csv(media_items: List[Dict[str, Any]], target_name: str) -> str:
     """Format results as CSV with columns."""
     if not media_items:
@@ -839,14 +1162,16 @@ def format_results_csv(media_items: List[Dict[str, Any]], target_name: str) -> s
 
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Post ID", "Shortcode", "Media Type", "Resolution", "Source", "Caption", "URL"])
+    writer.writerow(["Post ID", "Shortcode", "Media Type", "Resolution", "Collaborators", "Source", "Caption", "URL"])
 
     for it in media_items:
+        collabs_str = ", ".join(it.get("collabs", []))
         writer.writerow([
             it.get("post_id", ""),
             it.get("shortcode", ""),
             it.get("type_label", ""),
             it.get("resolution", ""),
+            collabs_str,
             it.get("source", ""),
             it.get("caption", "").replace("\n", " "),
             it.get("url", ""),
@@ -919,8 +1244,8 @@ def render_sidebar() -> Dict[str, Any]:
 
         # Anti-429 Rate-Limit Settings
         with st.expander("🔑 Cloud Bypass & Rate Limits (Fix 429)", expanded=False):
-            st.caption("Shared cloud servers (AWS / Streamlit Cloud) may get HTTP 429 rate-limited by Instagram. Adding your session cookie bypasses this instantly.")
-            
+            st.caption("Shared cloud servers (AWS / Streamlit Cloud) get HTTP 429 rate-limited by Instagram. Adding your session cookie bypasses this instantly.")
+
             cookie_default = ""
             try:
                 cookie_default = getattr(st, "secrets", {}).get("IG_COOKIE", "") or getattr(st, "secrets", {}).get("SESSION_ID", "")
@@ -934,6 +1259,27 @@ def render_sidebar() -> Dict[str, Any]:
                 help="Paste your sessionid from browser (F12 -> Application -> Cookies -> sessionid). Or set IG_COOKIE in Streamlit Secrets.",
                 placeholder="Paste sessionid or full cookie string"
             )
+
+            if cookie_input.strip():
+                if st.button("🔍 Verify Cookie Session", use_container_width=True, key="btn_verify_cookie"):
+                    with st.spinner("Testing session with Instagram API..."):
+                        test_sess = create_session(cookie_str=cookie_input, proxy_url=st.session_state.get("proxy_input", ""))
+                        is_ok, msg = validate_instagram_session(test_sess)
+                        if is_ok:
+                            st.success(f"🟢 **Session Verified:** {msg}")
+                        else:
+                            st.error(f"🔴 **Session Check:** {msg}")
+
+            with st.expander("❓ How to get sessionid (15 seconds)", expanded=False):
+                st.markdown(
+                    """
+                    1. Open [instagram.com](https://www.instagram.com) in your browser & log in.
+                    2. Press **F12** (Developer Tools).
+                    3. Click **Application** (Chrome/Edge) or **Storage** (Firefox) tab.
+                    4. Under **Cookies** → select `https://www.instagram.com`.
+                    5. Find **`sessionid`**, double click its value, copy and paste it above!
+                    """
+                )
 
             proxy_default = ""
             try:
@@ -1032,9 +1378,28 @@ def render_run_status() -> None:
                   <ol style='margin: 6px 0 0 0; padding-left: 22px; line-height: 1.7;'>
                     <li>Open the sidebar → expand <strong>🔑 Cloud Bypass & Rate Limits (Fix 429)</strong>.</li>
                     <li>Paste your Instagram <strong><code>sessionid</code></strong> cookie (from your browser DevTools → Application → Cookies → sessionid).</li>
+                    <li>Click <strong>🔍 Verify Cookie Session</strong> to confirm it works.</li>
                     <li><em>(Permanent fix)</em> In Streamlit Cloud: Click <strong>App Settings</strong> → <strong>Secrets</strong> and add:
                       <br><code>IG_COOKIE = "sessionid=YOUR_SESSION_ID"</code>
                     </li>
+                  </ol>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        elif "401" in err or "403" in err or "expired" in err.lower() or "login" in err.lower():
+            st.markdown(
+                f"""
+                <div class='error-box' style='border-left-color: #dc3545;'>
+                  <h4 style='margin:0 0 8px 0; color: #dc3545;'>🔴 Instagram Cookie Expired or Invalid</h4>
+                  <p style='margin:0 0 10px 0;'>
+                    {err}
+                  </p>
+                  <strong>💡 How to refresh your cookie:</strong>
+                  <ol style='margin: 6px 0 0 0; padding-left: 22px; line-height: 1.7;'>
+                    <li>Log into your account at <a href='https://www.instagram.com' target='_blank'>instagram.com</a> in your browser.</li>
+                    <li>Press <strong>F12</strong> → <strong>Application</strong> → <strong>Cookies</strong> → <code>https://www.instagram.com</code>.</li>
+                    <li>Copy the fresh <strong><code>sessionid</code></strong> value and update it in the sidebar.</li>
                   </ol>
                 </div>
                 """,
@@ -1056,7 +1421,7 @@ def render_run_status() -> None:
             """
             <div class='info-box'>
               <strong>ℹ️ NO MEDIA FOUND:</strong> No exposed media assets were detected for this target.<br>
-              Account may be strictly private without collabs/reels, empty, or rate-limited.
+              Account may be strictly private (and not followed by your session), empty, or rate-limited.
             </div>
             """,
             unsafe_allow_html=True,
@@ -1154,6 +1519,9 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
             caption = first_it.get("caption", "").strip()
             source = first_it.get("source", "")
 
+            collabs_list = first_it.get("collabs", [])
+            collab_badge_html = f" • <strong>Collab:</strong> <span style='color:#28a745; font-weight:700;'>@{', @'.join(collabs_list)}</span>" if collabs_list else ""
+
             st.markdown(
                 f"""
                 <div class='post-card'>
@@ -1162,7 +1530,7 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
                     {f"<a href='https://www.instagram.com/p/{shortcode}/' target='_blank' style='font-size: 0.85rem; font-weight: 600; text-decoration: none;'>🔗 View on Instagram ({shortcode})</a>" if shortcode else ""}
                   </div>
                   <p style='margin:4px 0 0 0; color:#666; font-size: clamp(0.8rem, 1.8vw, 0.9rem);'>
-                    <strong>Source:</strong> {source} • <strong>Assets:</strong> {len(items_for_p)}
+                    <strong>Source:</strong> {source} • <strong>Assets:</strong> {len(items_for_p)}{collab_badge_html}
                   </p>
                 </div>
                 """,
@@ -1188,7 +1556,10 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
                     else:
                         badge_class = "badge-image"
 
-                    st.markdown(f"<span class='{badge_class}'>{type_label}</span> <strong>{res}</strong>", unsafe_allow_html=True)
+                    item_collabs = it.get("collabs", [])
+                    item_collab_badge = f"<span class='badge-cover' style='background-color:#28a745;'>🤝 @{', @'.join(item_collabs)}</span> " if item_collabs else ""
+
+                    st.markdown(f"{item_collab_badge}<span class='{badge_class}'>{type_label}</span> <strong>{res}</strong>", unsafe_allow_html=True)
 
                     if show_previews:
                         if k == "video":
@@ -1223,6 +1594,7 @@ def render_results(target_name: str, media_items: List[Dict[str, Any]], ui: Dict
                 "Post ID": m.get("post_id"),
                 "Type": m.get("type_label"),
                 "Resolution": m.get("resolution"),
+                "Collaborators": ", ".join(m.get("collabs", [])) if m.get("collabs") else "None",
                 "Source": m.get("source"),
                 "Shortcode": m.get("shortcode") or "N/A",
                 "Caption": m.get("caption", "")[:60],
